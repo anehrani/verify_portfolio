@@ -1,0 +1,31 @@
+-R finshock-verify/theories FinShockVerify
+-R formal-mathfin-coq/theories MathFin
+-Q option-matching-paper Top
+-Q src FinanceVerify.Legacy
+-Q theories FinanceVerify
+-docroot FinanceVerify
+
+finshock-verify/theories/Core/SingleAsset.v
+finshock-verify/theories/Options/Vanilla.v
+finshock-verify/theories/Options/PortfolioValidation.v
+finshock-verify/theories/Options/CryptoProtectivePut.v
+finshock-verify/theories/Risk/WeightedStress.v
+finshock-verify/theories/Examples/LongOnlyETF.v
+
+formal-mathfin-coq/theories/Foundations/StatePrices.v
+formal-mathfin-coq/theories/Foundations/NoArbitrageDerivations.v
+formal-mathfin-coq/theories/AxiomAudit.v
+
+option-matching-paper/OptionMatchingPrototype.v
+option-matching-paper/Audit.v
+src/example.v
+
+theories/Interfaces.v
+theories/Core.v
+theories/Risk.v
+theories/Derivatives.v
+theories/Pricing.v
+theories/Exchange.v
+theories/Examples.v
+theories/All.v
+theories/Audit.v

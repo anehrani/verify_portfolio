@@ -1,0 +1,974 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{booktabs,array}
+\usepackage{listings}
+\usepackage{xcolor}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  citecolor=blue,
+  urlcolor=blue
+}
+
+\lstdefinestyle{coqstyle}{
+  basicstyle=\ttfamily\small,
+  columns=fullflexible,
+  breaklines=true,
+  frame=single,
+  backgroundcolor=\color{gray!5},
+  keywordstyle=\color{blue!70!black},
+  commentstyle=\color{green!40!black},
+  stringstyle=\color{red!60!black}
+}
+\lstset{style=coqstyle}
+
+\newtheorem{definition}{Definition}[section]
+\newtheorem{assumption}[definition]{Assumption}
+\newtheorem{lemma}[definition]{Lemma}
+\newtheorem{proposition}[definition]{Proposition}
+\newtheorem{theorem}[definition]{Theorem}
+\newtheorem{proofobligation}[definition]{Proof obligation}
+\newtheorem{corollary}[definition]{Corollary}
+\newtheorem{remark}[definition]{Remark}
+\newtheorem{example}[definition]{Example}
+\newenvironment{algorithmic-description}{\begin{quote}\small}{\end{quote}}
+
+\newcommand{\Buy}{\mathsf{Buy}}
+\newcommand{\Sell}{\mathsf{Sell}}
+\newcommand{\Call}{\mathsf{Call}}
+\newcommand{\Put}{\mathsf{Put}}
+\newcommand{\Amer}{\mathsf{American}}
+\newcommand{\Euro}{\mathsf{European}}
+\newcommand{\Ord}{\mathcal O}
+\newcommand{\Bids}{\mathcal B}
+\newcommand{\Asks}{\mathcal A}
+\newcommand{\Trades}{\mathcal M}
+\newcommand{\Contracts}{\mathcal C}
+\newcommand{\Price}{\mathbb P}
+\newcommand{\Time}{\mathbb T}
+\newcommand{\Qty}{\mathbb N}
+\newcommand{\Z}{\mathbb Z}
+\newcommand{\filled}{\operatorname{filled}}
+\newcommand{\legfilled}{\operatorname{legFilled}}
+\newcommand{\contract}{\operatorname{ctr}}
+\newcommand{\limitp}{\operatorname{lim}}
+\newcommand{\qty}{\operatorname{qty}}
+\newcommand{\side}{\operatorname{side}}
+\newcommand{\tick}{\operatorname{Tick}}
+\newcommand{\tradable}{\operatorname{Tradable}}
+\newcommand{\listed}{\operatorname{Listed}}
+\newcommand{\volume}{\operatorname{Vol}}
+\newcommand{\imb}{\operatorname{Imb}}
+\newcommand{\net}{\operatorname{Net}}
+\newcommand{\abs}{\operatorname{abs}}
+
+\title{A Coq Verification Blueprint for Option-Market Matching and Atomic Complex Orders}
+\author{Ali Nehrani\\
+\small Revised draft}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Electronic option exchanges match contract series rather than undifferentiated assets and must also process multi-leg strategies such as vertical spreads, straddles, butterflies, collars, and covered calls. Mechanical correctness therefore requires both ordinary order-book invariants and package-level ratio preservation: unless an instruction explicitly permits legging, a matching engine must not turn a complex order into a broken strategy.
+
+This paper presents a Coq verification blueprint and an initial Rocq prototype for option-market microstructure. The specification covers typed option contracts, single-series orders, continuous matching, uniform-price opening selection, and complex orders represented as signed leg bundles. The target properties are contract consistency, expiry and tick validity, no overfill, individual rationality, price-time fairness, maximum executable opening volume, and multi-leg consistency. Following the faithfulness-audit methodology used by Coelho's Lean 4 mathematical-finance library, every prototype result is classified as \emph{full}, \emph{library wrapper}, \emph{reduced core}, or \emph{placeholder}. At the present revision, the build contains 17 audited declarations: 10 full or wrapper results, one reduced core, and six admitted proof obligations. In particular, candidate-price maximality and a local contract-preservation lemma are checked, while end-to-end no-overfill, full opening allocation, and the executable complex-order matcher remain incomplete. The contribution is therefore a precise architecture, an auditable mechanization baseline, and a central ratio-preservation invariant--not yet a fully verified exchange engine.
+\end{abstract}
+
+\noindent\textbf{Keywords:} option markets; double auctions; formal verification; Rocq; Coq; matching engines; complex orders; opening auction; market microstructure.
+
+\section{Introduction}
+
+Modern financial exchanges are algorithmic institutions. They receive orders, rank them, match compatible buyers and sellers, allocate quantity, and report trades. For ordinary double auctions, recent formal-verification work has already shown that useful market-microstructure properties can be specified and proved in a theorem prover. In particular, Natarajan, Sarswat, and Singh formalize multi-quantity double-sided auctions in Coq, prove fairness, individual rationality, uniform matching, maximum matching, and uniqueness-style results, and extract certified programs that can be used to detect violations in exchange outputs~\cite{NatarajanSarswatSingh2021}. Garg et al. later extend this line of work with automated checkers for double auctions~\cite{GargRajaSarswatSingh2024}. These papers provide the closest formal foundation for the present project.
+
+Options markets require additional structure. A standard equity option contract is not merely an order for an abstract commodity. It is a series determined by an underlying security, strike, expiration, call-or-put type, exercise style, and contract multiplier. OCC product specifications state, for example, that standard equity option contracts cover 100 shares, quote premiums in points, use strike intervals, and are American-style in the ordinary listed-equity setting~\cite{OCCEquityOptions}. Therefore, a bid for one option series is not compatible with an ask for a different strike, expiration, option type, or underlying.
+
+The second layer of complexity is package execution. Options venues define and process complex orders involving concurrent execution of multiple series. Cboe's rulebook defines a complex order as an order or quote involving concurrent execution of two or more different series in the same underlying security or index~\cite{CboeRuleBook}. Cboe also distinguishes instructions such as all-or-none complex orders and ``Complex Only'' orders, and imposes execution-price protections for complex orders~\cite{CboeRuleBook}. These are not corner cases. SEC market-structure materials report customer options executions by sale condition and identify multi-leg electronic and multi-leg auction executions as substantial categories of dollar volume~\cite{SECOptionsRoundtable2026}. Thus, a verified theory of option-market matching must handle both single-series matching and package-level invariants.
+
+This paper proposes such a theory and begins its mechanization. The aim is not option pricing. We do not model stochastic dynamics, implied volatility, early exercise, delta hedging, or risk-neutral valuation. Instead, we isolate the microstructure problem:
+\begin{quote}
+\emph{When is an option matching engine mechanically correct?}
+\end{quote}
+The intended answer is the following proof-obligation package:
+\[
+\boxed{
+\begin{gathered}
+\text{contract consistency} + \text{expiry validity} + \text{tick validity} \\
++\; \text{no overfill} + \text{individual rationality} + \text{fairness} \\
++\; \text{maximum uniform auction volume} + \text{complex-order leg consistency}.
+\end{gathered}}
+\]
+The main new property is complex-order leg consistency. In a stock auction, a trade is usually a single matched buyer--seller pair. In an options market, a trader may submit a vertical spread, butterfly, straddle, strangle, collar, or covered call as one strategy. The matching engine must not fill the long call while failing to fill the short call, unless the submitted instruction explicitly permits legging or partial package execution. Package-level atomicity and ratio preservation are therefore the option-market analogue of no overfill and individual rationality.
+
+\paragraph{Contributions.}
+The paper makes the following contributions.
+\begin{enumerate}[label=(C\arabic*)]
+  \item We specify an option-contract and order model that makes series identity, expiry, price ticks, and package instructions explicit.
+  \item We implement an initial Rocq prototype for single-series matching, candidate-price selection, and signed complex-order legs.
+  \item We machine-check a local contract-preservation result and the maximality of the selected candidate opening price.
+  \item We isolate package-scale sharing as the core ``no broken strategy'' invariant and verify its algebraic core, while explicitly classifying the result as reduced because the executable complex matcher is not yet connected to it.
+  \item We adapt Coelho's statement-faithfulness discipline to this artifact through a declaration-level ledger, assumption printing, and kernel re-checking.
+\end{enumerate}
+
+\paragraph{Scope.}
+The first verified kernel should remain conservative. It should address market-mechanical correctness, not economic valuation. Static no-arbitrage restrictions such as call monotonicity and convexity across strikes are important, and option-pricing theory imposes shape restrictions on call prices as functions of strike~\cite{AitSahaliaDuarte2002}. However, those restrictions belong to a separate post-clearing price-system validator rather than to the core matching kernel. The present artifact is a partially mechanized baseline: only declarations marked \emph{full} or \emph{library wrapper} in Section~\ref{sec:audit} are claimed as completed results.
+
+\section{Related Work}
+
+\subsection{Verified double-sided auctions}
+
+The closest formal baseline is the Coq-formalized double-auction literature. Natarajan, Sarswat, and Singh model bids, asks, transactions, quantities, timestamps, and prices; define matchings between duplicate-free bid and ask lists; define individual rationality as execution prices lying between bid and ask limits; define fairness in terms of competitiveness; and prove correctness of fair, uniform, and maximum matching mechanisms~\cite{NatarajanSarswatSingh2021}. Their work is highly relevant because it already handles multi-quantity orders and extraction of verified OCaml/Haskell programs. Garg et al. continue this line with automated checkers and uniqueness results~\cite{GargRajaSarswatSingh2024}.
+
+The present work differs in the object language and in the package-level invariants. The existing double-auction framework treats a generic product. In options, the product is a contract series. A direct match must preserve the full series identity. Furthermore, options venues support complex orders whose execution correctness is not reducible to independent single-leg matching.
+
+\subsection{Audited formalized mathematical finance}
+
+Coelho's Lean 4 library develops a broad machine-checked foundation for mathematical finance, including stochastic calculus, derivative pricing, portfolio theory, risk measures, fixed income, actuarial mathematics, and decentralized finance~\cite{Coelho2026}. Its subject matter is largely complementary to the matching problem studied here: Coelho verifies the mathematical and pricing layer, whereas this paper targets order-book and package-execution mechanics.
+
+The methodological overlap is more important. Coelho classifies each result as \emph{full}, \emph{library wrapper}, \emph{reduced core}, or \emph{placeholder}, and couples the classification to an axiom audit. We adopt the same vocabulary in Section~\ref{sec:audit}. This prevents a proof sketch, an admitted Coq declaration, or a theorem about a simplified algebraic core from being reported as an end-to-end verified matching mechanism. The audit is particularly valuable here because the prototype already contains meaningful checked lemmas alongside unfinished sorting, allocation, and complex-execution bridges.
+
+\subsection{Options-market microstructure}
+
+Listed options are organized by option class and series. OCC specifications describe standard equity option units, premium quotations, strike intervals, exercise style, exercise settlement, and expiration dates~\cite{OCCEquityOptions}. Exchange rulebooks then specify how orders and quotes are accepted, ranked, opened, matched, and protected. For example, Cboe's opening process determines an opening trade price for a series when orders and quotes are marketable against each other; the stated VMIM criterion is volume-maximizing and imbalance-minimizing within the opening collar~\cite{CboeRuleBook}. Cboe's complex-order rules define concurrent multi-series execution, all-or-none instructions, legging behavior, and execution-price protections~\cite{CboeRuleBook}.
+
+This rulebook structure motivates the formal properties introduced below. Contract consistency corresponds to series identity. Expiry validity corresponds to preventing trades after the contract is no longer tradable. Tick validity corresponds to exchange minimum-increment regimes. Leg consistency corresponds to the concurrent-execution nature of complex orders.
+
+\subsection{Static no-arbitrage and option price systems}
+
+The present paper does not attempt to verify a pricing model. Nevertheless, it is useful to distinguish matching correctness from no-arbitrage price-system correctness. In classical option theory, same-expiry calls should be decreasing and convex in strike under no-arbitrage restrictions; Ait-Sahalia and Duarte use such monotonicity and convexity restrictions in nonparametric option-pricing estimation~\cite{AitSahaliaDuarte2002}. These restrictions are cross-series properties of price surfaces. They are not identical to the local execution invariants of a matching engine. We therefore treat static no-arbitrage constraints as an optional layer in Section~\ref{sec:noarb}.
+
+\section{Preliminaries and Design Principles}
+
+We use discrete types throughout. This choice is both faithful to implementation and convenient for mechanization. Prices are integer ticks, times are discrete timestamps, and orders are finite records contained in finite lists. The model is intended for Coq formalization, so all predicates should be decidable whenever they are used computationally.
+
+Let \(\Price\subseteq \mathbb N\) denote nonnegative integer prices measured in the smallest exchange-relevant unit. Let \(\Time\subseteq\mathbb N\) denote timestamps. Let \(\mathcal U\) denote a finite or countable set of underlyings. Let \(\mathsf{OrderId}\) and \(\mathsf{TraderId}\) be decidable identifier types.
+
+The development follows three design principles.
+\begin{enumerate}[label=(P\arabic*)]
+  \item \textbf{Series separation.} Simple matching is performed only within one option contract series. Cross-series interaction appears only in complex orders or optional no-arbitrage validation.
+  \item \textbf{Integer arithmetic.} Prices, quantities, package limits, and tick predicates are discrete. No proof should depend on real-number rounding unless a separate rounding lemma is supplied.
+  \item \textbf{Layered verification.} The matching, auction, and package layers expose checked invariants to their successors.
+\end{enumerate}
+
+\section{Formal Model of Option Contracts}
+
+\begin{definition}[Option type and exercise style]
+Let
+\[
+\mathsf{OType}=\{\Call,\Put\},
+\qquad
+\mathsf{Style}=\{\Amer,\Euro\}.
+\]
+An element of \(\mathsf{OType}\) records whether the option is a call or put. An element of \(\mathsf{Style}\) records the exercise style. The exercise style is part of the contract identity even though the matching engine does not price early exercise.
+\end{definition}
+
+\begin{definition}[Option contract]
+An option contract is a tuple
+\[
+C=(u,K,T,\tau,\sigma,\mu,\delta),
+\]
+where \(u\in\mathcal U\) is the underlying, \(K\in\Price\) is the strike, \(T\in\Time\) is the expiration timestamp, \(\tau\in\mathsf{OType}\), \(\sigma\in\mathsf{Style}\), \(\mu\in\mathbb N\) is the multiplier, and \(\delta:\Price\to\mathsf{Prop}\) is the tick-validity predicate.
+\end{definition}
+
+\begin{definition}[Contract equality]
+Two contracts are equal when all contract fields agree:
+\[
+\begin{aligned}
+C_1=C_2
+\iff{}& u(C_1)=u(C_2)\;\wedge\; K(C_1)=K(C_2)\;\wedge\; T(C_1)=T(C_2)\\
+&\wedge\; \tau(C_1)=\tau(C_2)\;\wedge\; \sigma(C_1)=\sigma(C_2)\;\wedge\; \mu(C_1)=\mu(C_2)\\
+&\wedge\; \delta(C_1)=\delta(C_2).
+\end{aligned}
+\]
+In Coq, the tick predicate should normally be represented by a decidable code or by a structure with proof-irrelevant equality assumptions, rather than by arbitrary functional equality.
+\end{definition}
+
+\begin{definition}[Tradable contract]
+At time \(t\), a contract \(C\) is tradable if
+\[
+\tradable(C,t)
+\iff
+\listed(C,t)\wedge t<T(C)\wedge \mu(C)>0.
+\]
+Here \(\listed(C,t)\) abstracts exchange-specific listing rules.
+\end{definition}
+
+\begin{remark}
+The tradability predicate deliberately separates expiration validity from listing validity. A contract can fail to be tradable because it has expired, because it is not listed, or because its multiplier is invalid. This separation is helpful for both proof debugging and executable error reporting.
+\end{remark}
+
+\section{Simple Option Orders and Matchings}
+
+\begin{definition}[Simple option order]
+A simple option order is a tuple
+\[
+o=(s,C,q,p,t,\iota,\eta),
+\]
+where \(s\in\{\Buy,\Sell\}\) is the side, \(C\in\Contracts\) is the contract, \(q\in\mathbb N\) is the submitted quantity, \(p\in\Price\) is the limit price, \(t\in\Time\) is the timestamp, \(\iota\in\mathsf{OrderId}\) is the order identifier, and \(\eta\) is an instruction such as day, IOC, FOK, or AON.
+\end{definition}
+
+We write \(\side(o)\), \(\contract(o)\), \(\qty(o)\), and \(\limitp(o)\) for the corresponding fields.
+
+\begin{definition}[Transaction]
+A simple option transaction is a tuple
+\[
+m=(b,a,q_m,p_m),
+\]
+where \(b\) is a buy order, \(a\) is a sell order, \(q_m\in\mathbb N\) is the executed quantity, and \(p_m\in\Price\) is the execution price.
+\end{definition}
+
+\begin{definition}[Filled quantity]
+For an order \(o\) and transaction list \(M\), define
+\[
+\filled(o,M)
+=
+\sum_{m\in M:\ b(m)=o} q_m
++
+\sum_{m\in M:\ a(m)=o} q_m.
+\]
+\end{definition}
+
+\begin{definition}[Valid simple matching]
+Let \(B\) be a duplicate-free list of buy orders and \(A\) a duplicate-free list of sell orders. A transaction list \(M\) is a valid simple option matching for \((B,A,t)\) if the following hold:
+\begin{enumerate}[label=(M\arabic*)]
+  \item \textbf{Membership:} every transaction uses a bid from \(B\) and an ask from \(A\).
+  \item \textbf{Side correctness:} each transaction pairs a buy order with a sell order.
+  \item \textbf{Positive quantity:} every transaction has \(q_m>0\).
+  \item \textbf{Contract consistency:} \(\contract(b(m))=\contract(a(m))\) for all \(m\in M\).
+  \item \textbf{Tradability:} \(\tradable(\contract(b(m)),t)\) for all \(m\in M\).
+  \item \textbf{Limit compatibility:} \(\limitp(a(m))\le \limitp(b(m))\) for all \(m\in M\).
+  \item \textbf{No overfill:} \(\filled(o,M)\le \qty(o)\) for every \(o\in B\cup A\).
+  \item \textbf{Tick validity:} \(\delta_{\contract(b(m))}(p_m)\) for all \(m\in M\).
+\end{enumerate}
+\end{definition}
+
+\begin{definition}[Individual rationality]
+A matching \(M\) is individually rational if
+\[
+\forall m\in M,
+\qquad
+\limitp(a(m))\le p_m\le \limitp(b(m)).
+\]
+\end{definition}
+
+\begin{definition}[Contract consistency]
+A matching \(M\) is contract-consistent if
+\[
+\forall m\in M,
+\qquad
+\contract(b(m))=\contract(a(m)).
+\]
+\end{definition}
+
+\begin{definition}[Expiry validity]
+A matching \(M\) is expiry-valid at time \(t\) if
+\[
+\forall m\in M,
+\qquad
+ t<T(\contract(b(m))).
+\]
+\end{definition}
+
+\begin{definition}[Tick validity]
+A matching \(M\) is tick-valid if
+\[
+\forall m\in M,
+\qquad
+\delta_{\contract(b(m))}(p_m).
+\]
+\end{definition}
+
+\section{Price-Time Priority}
+
+For bids on the same contract, define competitiveness by
+\[
+b_1\succ_B b_2
+\iff
+\limitp(b_1)>\limitp(b_2)
+\quad\text{or}\quad
+\bigl(\limitp(b_1)=\limitp(b_2)\wedge t(b_1)<t(b_2)\bigr).
+\]
+For asks on the same contract,
+\[
+a_1\succ_A a_2
+\iff
+\limitp(a_1)<\limitp(a_2)
+\quad\text{or}\quad
+\bigl(\limitp(a_1)=\limitp(a_2)\wedge t(a_1)<t(a_2)\bigr).
+\]
+
+\begin{definition}[Bid fairness]
+A matching \(M\) is bid-fair if, for every two buy orders \(b_1,b_2\) on the same contract,
+\[
+b_1\succ_B b_2\wedge \filled(b_2,M)>0
+\Longrightarrow
+\filled(b_1,M)=\qty(b_1).
+\]
+\end{definition}
+
+\begin{definition}[Ask fairness]
+A matching \(M\) is ask-fair if, for every two sell orders \(a_1,a_2\) on the same contract,
+\[
+a_1\succ_A a_2\wedge \filled(a_2,M)>0
+\Longrightarrow
+\filled(a_1,M)=\qty(a_1).
+\]
+\end{definition}
+
+\begin{definition}[Price-time fairness]
+A matching is price-time fair if it is both bid-fair and ask-fair.
+\end{definition}
+
+\begin{remark}
+The specification chooses the price-time version. Some actual options venues use pro-rata, customer-priority overlays, or hybrid allocation rules in particular classes. A mature formalization should parameterize fairness by allocation policy. Price-time priority is chosen here because it is the cleanest starting point and the closest analogue of the formal double-auction literature.
+\end{remark}
+
+\section{Single-Contract Continuous Matching: Specification and Proof Obligations}
+
+Fix a contract \(C\). Define the filtered books
+\[
+B_C=\{b\in B:\side(b)=\Buy,\ \contract(b)=C,\ \tradable(C,t)\},
+\]
+\[
+A_C=\{a\in A:\side(a)=\Sell,\ \contract(a)=C,\ \tradable(C,t)\}.
+\]
+The continuous matching procedure sorts \(B_C\) by descending bid competitiveness and \(A_C\) by descending ask competitiveness. It recursively matches the heads whenever
+\[
+\limitp(a)\le \limitp(b).
+\]
+The executed quantity is
+\[
+q_m=\min(q_{\mathrm{rem}}(b),q_{\mathrm{rem}}(a)),
+\]
+and the price is chosen by a deterministic pricing rule
+\[
+p_m=\mathsf{PriceRule}(b,a),
+\]
+subject to the precondition
+\[
+\limitp(a)\le \mathsf{PriceRule}(b,a)\le \limitp(b),
+\qquad
+\delta_C(\mathsf{PriceRule}(b,a)).
+\]
+
+\begin{algorithmic-description}
+\textbf{Algorithm \(\mathsf{MatchSeries}(C,B,A,t)\).}
+\begin{enumerate}[label=\arabic*.]
+  \item Filter \(B\) and \(A\) to valid orders on contract \(C\).
+  \item Sort bids by \(\succ_B\) and asks by \(\succ_A\).
+  \item While both lists are nonempty and the best ask is compatible with the best bid, trade the minimum residual quantity.
+  \item Remove fully filled orders and retain partially filled residual orders.
+  \item Return the generated transaction list.
+\end{enumerate}
+\end{algorithmic-description}
+
+\begin{proofobligation}[Contract consistency of single-series matching]
+For every contract \(C\), book pair \((B,A)\), and time \(t\), if
+\[
+M=\mathsf{MatchSeries}(C,B,A,t),
+\]
+then
+\[
+\forall m\in M,
+\qquad
+\contract(b(m))=\contract(a(m))=C.
+\]
+\end{proofobligation}
+
+\begin{proof}[Proof sketch]
+The algorithm emits transactions only from the filtered lists \(B_C\) and \(A_C\). Every bid in \(B_C\) and every ask in \(A_C\) has contract \(C\). The result follows by induction on the recursive construction of \(M\). In the base case, no transaction is emitted. In the inductive case, the emitted head transaction is contract-consistent by the filter invariant, and the remaining transactions are contract-consistent by the induction hypothesis.
+\end{proof}
+
+\begin{proofobligation}[No overfill]
+For every order \(o\in B\cup A\),
+\[
+\filled(o,\mathsf{MatchSeries}(C,B,A,t))\le \qty(o).
+\]
+\end{proofobligation}
+
+\begin{proof}[Proof sketch]
+Maintain the invariant
+\[
+\qty(o)=\filled(o,M_{\mathrm{prefix}})+q_{\mathrm{rem}}(o)
+\]
+for every active order after every recursive step. A step trades the minimum of the residual quantities of the current best bid and ask, so no residual quantity becomes negative. Therefore \(\filled(o,M)\le\qty(o)\) for every order at termination.
+\end{proof}
+
+\begin{proofobligation}[Individual rationality and tick validity]
+Assume the pricing rule satisfies
+\[
+\limitp(a)\le\mathsf{PriceRule}(b,a)\le\limitp(b)
+\quad\text{and}\quad
+\delta_C(\mathsf{PriceRule}(b,a))
+\]
+whenever \(b\) and \(a\) are matched by \(\mathsf{MatchSeries}\). Then the output matching is individually rational and tick-valid.
+\end{proofobligation}
+
+\begin{proof}[Proof sketch]
+Every emitted transaction receives its price from \(\mathsf{PriceRule}\). The theorem follows by applying the pricing-rule precondition to each emitted transaction.
+\end{proof}
+
+\begin{proofobligation}[Price-time fairness]
+The output \(\mathsf{MatchSeries}(C,B,A,t)\) is price-time fair.
+\end{proofobligation}
+
+\begin{proof}[Proof sketch]
+The algorithm consumes sorted bid and ask lists from most competitive to least competitive. A less competitive bid can be reached only after all more competitive bids have either been fully filled or no compatible ask remains. If the less competitive bid receives a positive fill, compatible liquidity existed at that step; hence all earlier bids must have been fully filled. The ask-side argument is symmetric.
+\end{proof}
+
+\section{Opening Auction for One Option Series: Specification and Proof Obligations}
+
+For a fixed contract \(C\), an opening auction receives queued buy and sell orders before continuous trading begins. A uniform-price matching is a matching in which every transaction executes at the same price:
+\[
+\forall m_1,m_2\in M,
+\qquad p_{m_1}=p_{m_2}.
+\]
+
+For a candidate clearing price \(p\), define executable demand and supply:
+\[
+D_C(p)=\sum_{b\in B_C:\ \limitp(b)\ge p}\qty(b),
+\qquad
+S_C(p)=\sum_{a\in A_C:\ \limitp(a)\le p}\qty(a).
+\]
+The executable volume is
+\[
+V_C(p)=\min(D_C(p),S_C(p)),
+\]
+and the imbalance is
+\[
+I_C(p)=|D_C(p)-S_C(p)|.
+\]
+
+\begin{definition}[Opening price]
+Let \(\Pi_C\subseteq\Price\) be the finite set of candidate tick-valid prices. The opening price \(p^\star\) is selected lexicographically:
+\begin{enumerate}[label=(O\arabic*)]
+  \item maximize \(V_C(p)\);
+  \item among volume maximizers, minimize \(I_C(p)\);
+  \item among remaining candidates, apply a deterministic tie-breaker.
+\end{enumerate}
+\end{definition}
+
+This abstraction mirrors the exchange-rule idea of a volume-maximizing, imbalance-minimizing opening price, while leaving exchange-specific collars and tie-breakers as parameters.
+
+\begin{definition}[Uniform valid matching]
+A matching \(M\) is uniform-valid for \((C,B,A,t)\) if it is a valid simple matching, every transaction is on contract \(C\), every trade price equals a common price \(p\), and every trade is individually rational at \(p\).
+\end{definition}
+
+\begin{proofobligation}[Maximum uniform clearing volume]
+Let
+\[
+p^\star=\mathsf{OpenPrice}(C,B,A,t),
+\qquad
+M^\star=\mathsf{OpenAuction}(C,B,A,t).
+\]
+Then \(M^\star\) is a uniform-valid matching at \(p^\star\), and for every uniform-valid matching \(M\),
+\[
+Q(M)\le Q(M^\star),
+\]
+where \(Q(M)=\sum_{m\in M}q_m\).
+\end{proofobligation}
+
+\begin{proof}[Proof sketch]
+Fix any uniform-valid matching \(M\) at price \(p\). Every matched bid must have \(\limitp(b)\ge p\), and every matched ask must have \(\limitp(a)\le p\). Hence
+\[
+Q(M)\le D_C(p),
+\qquad
+Q(M)\le S_C(p),
+\]
+so
+\[
+Q(M)\le V_C(p).
+\]
+Since \(p^\star\) maximizes \(V_C\), we have \(V_C(p)\le V_C(p^\star)\). The construction of \(\mathsf{OpenAuction}\) fills exactly \(V_C(p^\star)\) eligible contracts at price \(p^\star\), so \(Q(M^\star)=V_C(p^\star)\). Therefore \(Q(M)\le Q(M^\star)\).
+\end{proof}
+
+\begin{proofobligation}[Opening-auction correctness]
+The output \(\mathsf{OpenAuction}(C,B,A,t)\) satisfies contract consistency, no overfill, individual rationality, tick validity, expiry validity, uniformity, and maximum uniform volume.
+\end{proofobligation}
+
+\begin{proof}[Proof sketch]
+Contract consistency and expiry validity follow from the contract filter. No overfill follows from the same residual-quantity invariant used in continuous matching. Uniformity follows because every emitted transaction is assigned \(p^\star\). Individual rationality follows from eligibility at \(p^\star\). Tick validity follows from \(p^\star\in\Pi_C\). Maximum uniform volume is the previous theorem.
+\end{proof}
+
+\section{Complex Option Orders}\label{sec:complex}
+
+A complex option order is a package of signed legs. The sign records whether the package buyer buys or sells the corresponding option contract. The absolute value records the leg ratio.
+
+\begin{definition}[Leg]
+A leg is a pair
+\[
+\ell=(C,r),
+\]
+where \(C\in\Contracts\) and \(r\in\mathbb Z\setminus\{0\}\). Positive \(r\) denotes a buy leg and negative \(r\) denotes a sell leg from the perspective of the package buyer.
+\end{definition}
+
+\begin{definition}[Strategy]
+A complex option strategy is a finite list
+\[
+\Theta=[(C_1,r_1),\ldots,(C_n,r_n)]
+\]
+with \(n\ge 2\), \(r_i\ne0\), and each \(C_i\) tradable at the relevant time. Additional exchange-specific constraints may restrict repeated contracts, maximum leg count, allowed ratios, or underlying consistency.
+\end{definition}
+
+\begin{example}[Vertical call spread]
+A one-by-one vertical call spread with common underlying and expiry is
+\[
+\Theta_{\mathrm{vertical}}
+= [(C^{\Call}_{K_1,T},+1),(C^{\Call}_{K_2,T},-1)].
+\]
+\end{example}
+
+\begin{example}[Long straddle]
+A long straddle is
+\[
+\Theta_{\mathrm{straddle}}
+= [(C^{\Call}_{K,T},+1),(C^{\Put}_{K,T},+1)].
+\]
+\end{example}
+
+\begin{example}[Butterfly]
+A call butterfly may be represented as
+\[
+\Theta_{\mathrm{fly}}
+= [(C^{\Call}_{K_1,T},+1),(C^{\Call}_{K_2,T},-2),(C^{\Call}_{K_3,T},+1)].
+\]
+\end{example}
+
+\begin{definition}[Complex order]
+A complex order is a tuple
+\[
+O^\Theta=(\Theta,Q_\Theta,P_\Theta,t,\iota,\eta),
+\]
+where \(\Theta\) is a strategy, \(Q_\Theta\in\mathbb N\) is the package quantity, \(P_\Theta\in\Price\) is the package limit price, \(t\) is the timestamp, \(\iota\) is the package order identifier, and \(\eta\) is the instruction.
+\end{definition}
+
+\begin{definition}[Leg-consistent execution]
+An execution \(X\) of \(O^\Theta\) is leg-consistent if there exists a package scale \(k\in\mathbb N\) such that
+\[
+\forall i\in\{1,\ldots,n\},
+\qquad
+\legfilled_i(X)=k|r_i|.
+\]
+For an all-or-none order, \(k\in\{0,Q_\Theta\}\). For a partial ratio-preserving order, \(0\le k\le Q_\Theta\).
+\end{definition}
+
+\begin{definition}[Net package price]
+If leg \(i\) executes at price \(p_i\), the signed net package price is
+\[
+\net(X)=\sum_{i=1}^n r_i p_i.
+\]
+For a package buy order, net rationality requires \(\net(X)\le P_\Theta\). For a package sell order, it requires \(\net(X)\ge P_\Theta\).
+\end{definition}
+
+\begin{remark}
+The sign convention can be changed, but it must be fixed once and used consistently. In implementation, it is often convenient to represent package side separately from signed leg direction. The theorem statements are invariant under this refactoring.
+\end{remark}
+
+\section{Complex-Order Matching Algorithm}
+
+The complex-order matching algorithm has three stages.
+
+\paragraph{Stage 1: strategy validation.}
+The predicate \(\mathsf{ValidStrategy}(\Theta,t)\) checks that the strategy has at least two legs, every leg ratio is nonzero, every leg contract is tradable at \(t\), every leg uses a valid tick grid, and all exchange-specific leg-count and underlying restrictions hold.
+
+\paragraph{Stage 2: executable-scale computation.}
+For each leg \(i\), let \(L_i\) be the available opposite-side liquidity for that leg, computed from the permitted liquidity sources: simple book, complex book, auction responses, or a venue-specific combination. The maximum feasible package scale is
+\[
+k_{\max}=\min_i\left\lfloor\frac{L_i}{|r_i|}\right\rfloor.
+\]
+
+\paragraph{Stage 3: ratio-preserving execution.}
+If the instruction is AON, execute if and only if \(k_{\max}\ge Q_\Theta\), then set \(k=Q_\Theta\). If the instruction is FOK, perform the same test immediately and cancel otherwise. If partial ratio-preserving execution is allowed, set
+\[
+k=\min(Q_\Theta,k_{\max}).
+\]
+The algorithm emits leg transactions with quantities \(k|r_i|\) for every leg \(i\), or emits nothing.
+
+\begin{proofobligation}[Complex-order leg consistency]
+Let
+\[
+X=\mathsf{MatchComplex}(O^\Theta,\mathcal B,t)
+\]
+be the execution generated by the complex-order matching algorithm against books \(\mathcal B\). If \(X\) is nonempty, then there exists \(k\in\mathbb N\) such that
+\[
+\forall i,
+\qquad
+\legfilled_i(X)=k|r_i|.
+\]
+If \(O^\Theta\) is AON, then \(k=Q_\Theta\). If partial ratio-preserving execution is permitted, then \(0<k\le Q_\Theta\).
+\end{proofobligation}
+
+\begin{proof}[Proof sketch]
+The algorithm computes a single package scale \(k\) before emitting any component transaction. Every emitted leg quantity is obtained by multiplying \(|r_i|\) by that same \(k\). Therefore all component fills are normalized by the same package scale. In the AON branch, emission occurs only after checking \(k_{\max}\ge Q_\Theta\), and the algorithm sets \(k=Q_\Theta\). In the partial branch, \(k=\min(Q_\Theta,k_{\max})\), so \(k\le Q_\Theta\).
+\end{proof}
+
+\begin{proofobligation}[No broken strategy]
+For any complex order \(O^\Theta\), the algorithm cannot produce an execution \(X\) and legs \(i,j\) such that
+\[
+\legfilled_i(X)|r_j|
+\ne
+\legfilled_j(X)|r_i|
+\]
+while both legs are required by \(\Theta\).
+\end{proofobligation}
+
+\begin{proof}[Proof sketch]
+By leg consistency, there exists a common package scale \(k\) such that \(\legfilled_i(X)=k|r_i|\) for all \(i\). Both sides of the displayed inequality therefore equal \(k|r_i||r_j|\).
+\end{proof}
+
+\begin{proofobligation}[Complex no-overfill]
+For every complex order \(O^\Theta\),
+\[
+\mathrm{filledPackage}(O^\Theta,X)\le Q_\Theta,
+\]
+and every leg satisfies
+\[
+\legfilled_i(X)\le Q_\Theta |r_i|.
+\]
+\end{proofobligation}
+
+\begin{proof}[Proof sketch]
+Leg consistency gives \(\legfilled_i(X)=k|r_i|\). The algorithm always chooses \(k\le Q_\Theta\). Therefore \(\legfilled_i(X)\le Q_\Theta|r_i|\).
+\end{proof}
+
+\begin{proofobligation}[Net package rationality]
+Assume the complex pricing rule checks the package limit and component tick predicates before execution. Then every complex execution satisfies net package rationality and tick validity.
+\end{proofobligation}
+
+\begin{proof}[Proof sketch]
+The algorithm emits a complex execution only after verifying the relevant net-price inequality and each component tick predicate. Since the emitted execution is exactly the checked execution, the result follows by unfolding the guard condition.
+\end{proof}
+
+\section{Optional Static No-Arbitrage Layer}\label{sec:noarb}
+
+The intended matching layer addresses mechanical correctness. Even when completed, it will not guarantee that the entire cross-section of option prices is arbitrage-free. A separate validator may check static restrictions such as monotonicity and convexity across strikes.
+
+For calls with the same underlying and expiry,
+\[
+K_1<K_2
+\Longrightarrow
+C(K_1,T)\ge C(K_2,T).
+\]
+For puts,
+\[
+K_1<K_2
+\Longrightarrow
+P(K_1,T)\le P(K_2,T).
+\]
+Discrete convexity of calls can be stated as
+\[
+\frac{C(K_2,T)-C(K_1,T)}{K_2-K_1}
+\le
+\frac{C(K_3,T)-C(K_2,T)}{K_3-K_2},
+\qquad K_1<K_2<K_3.
+\]
+Equivalently, for equally spaced strikes,
+\[
+C(K_1,T)-2C(K_2,T)+C(K_3,T)\ge0.
+\]
+
+\begin{remark}
+These constraints should not be mixed into the first matching correctness theorem. A matching engine can mechanically execute orders correctly even when the displayed option chain contains an arbitrage opportunity. Conversely, a no-arbitrage repair procedure can adjust or flag cross-series price surfaces without changing the correctness of individual trade execution.
+\end{remark}
+
+\section{Rocq Prototype, Faithfulness Audit, and Completion Plan}\label{sec:audit}
+
+The accompanying prototype is a single Rocq source file plus an audit module and a declaration-level CSV ledger. It builds under Rocq 9.1.1. The ledger contains 17 proof declarations: 10 are classified \emph{full} or \emph{library wrapper}, one is a \emph{reduced core}, and six are \emph{placeholders} implemented with \texttt{Admitted}. Helper lemmas are included in these counts; the paper-facing status is summarized in Table~\ref{tab:audit}.
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{
+  >{\raggedright\arraybackslash}p{0.30\linewidth}
+  >{\raggedright\arraybackslash}p{0.18\linewidth}
+  >{\raggedright\arraybackslash}p{0.43\linewidth}}
+\toprule
+Claim or component & Status & Exact checked scope \\
+\midrule
+Recursive-step contract preservation & Full &
+\texttt{match\_step\_contract\_consistency} preserves a common contract assuming both residual books already contain only that contract. \\
+End-to-end series contract consistency & Placeholder &
+The bridge through filtering and sorting is admitted. \\
+End-to-end no overfill & Placeholder &
+The residual-quantity invariant and the final \texttt{match\_series} theorem are admitted. \\
+Limit respect and price-time fairness & Placeholder &
+The limit-respect lemma is admitted; fairness is not yet declared. \\
+Candidate opening-price maximality & Full &
+\texttt{clearing\_price\_maximal} maximizes the executable-volume function over an explicit nonempty candidate list. \\
+Opening-auction mechanism & Library wrapper / placeholder &
+\texttt{opening\_auction\_optimal} restates candidate-price maximality; no allocation-producing opening-auction function is yet verified. \\
+No-broken-strategy invariant & Reduced core &
+\texttt{no\_broken\_strategy} is checked for fills defined directly from one shared package scale; it is not yet connected to an executable complex matcher. \\
+Per-leg liquidity bound & Placeholder &
+\texttt{executed\_fill\_no\_overfill} is admitted. \\
+\bottomrule
+\end{tabular}
+\caption{Faithfulness audit of the paper-facing claims.}
+\label{tab:audit}
+\end{table}
+
+The audit module runs \texttt{Print Assumptions} on the completed headline results. Those results are closed under the global context. A separate \texttt{rocq check} invocation rechecks the compiled module and reports the six admitted declarations as axioms in the module context. This distinction matters: kernel checking establishes the completed local results, while the ledger prevents incomplete declarations elsewhere in the file from being silently counted as verified contributions.
+
+The reproducible commands are:
+\begin{lstlisting}
+make build
+make audit
+\end{lstlisting}
+
+The remainder of this section records the intended modular interfaces. These snippets are completion targets, not claims about the current prototype.
+
+\subsection{Module \texttt{Contract}}
+
+\begin{lstlisting}
+Inductive option_type := Call | Put.
+Inductive exercise_style := American | European.
+
+Record contract := {
+  underlying : UnderlyingId;
+  strike     : price;
+  expiry     : time;
+  otype      : option_type;
+  style      : exercise_style;
+  multiplier : nat;
+  tick_valid : price -> Prop
+}.
+
+Definition expiry_valid (now : time) (c : contract) : Prop :=
+  now < expiry c.
+
+Definition tradable (now : time) (c : contract) : Prop :=
+  listed now c /\ expiry_valid now c /\ multiplier c > 0.
+\end{lstlisting}
+
+A practical implementation should avoid arbitrary functional equality on \texttt{tick\_valid}. One option is to store a finite tick-regime code and separately interpret it as a predicate.
+
+\subsection{Module \texttt{Order}}
+
+\begin{lstlisting}
+Inductive side := Buy | Sell.
+Inductive instruction := Day | IOC | FOK | AON | PartialPackage.
+
+Record order := {
+  oside  : side;
+  octr   : contract;
+  oqty   : nat;
+  olimit : price;
+  ots    : time;
+  oid    : order_id;
+  instr  : instruction
+}.
+\end{lstlisting}
+
+\subsection{Module \texttt{SimpleMatching}}
+
+\begin{lstlisting}
+Record trade := {
+  tbid   : order;
+  task   : order;
+  tqty   : nat;
+  tprice : price
+}.
+
+Definition contract_consistent (M : list trade) : Prop :=
+  forall m, In m M -> octr (tbid m) = octr (task m).
+
+Definition individual_rational (M : list trade) : Prop :=
+  forall m, In m M ->
+    olimit (task m) <= tprice m /\ tprice m <= olimit (tbid m).
+\end{lstlisting}
+
+Representative theorem targets:
+
+\begin{lstlisting}
+Theorem match_series_contract_consistent :
+  forall C B A now,
+    contract_consistent (match_series C B A now).
+
+Theorem match_series_no_overfill :
+  forall C B A now o,
+    filled o (match_series C B A now) <= oqty o.
+
+Theorem match_series_IR :
+  forall C B A now,
+    individual_rational (match_series C B A now).
+
+Theorem match_series_fair :
+  forall C B A now,
+    price_time_fair (match_series C B A now).
+\end{lstlisting}
+
+\subsection{Module \texttt{OpeningAuction}}
+
+\begin{lstlisting}
+Definition demand_at (C : contract) (B : list order) (p : price) : nat :=
+  sum_qty (filter (fun b => same_contract (octr b) C && (p <=? olimit b)) B).
+
+Definition supply_at (C : contract) (A : list order) (p : price) : nat :=
+  sum_qty (filter (fun a => same_contract (octr a) C && (olimit a <=? p)) A).
+
+Definition executable_volume C B A p :=
+  Nat.min (demand_at C B p) (supply_at C A p).
+\end{lstlisting}
+
+Main theorem target:
+
+\begin{lstlisting}
+Theorem opening_auction_max_uniform :
+  forall C B A now M,
+    uniform_valid C now M ->
+    total_qty M <= total_qty (open_auction C B A now).
+\end{lstlisting}
+
+\subsection{Module \texttt{ComplexOrder}}
+
+\begin{lstlisting}
+Record leg := {
+  lctr  : contract;
+  ratio : Z
+}.
+
+Record complex_order := {
+  legs      : list leg;
+  pkg_qty   : nat;
+  pkg_limit : price;
+  pkg_ts    : time;
+  pkg_id    : order_id;
+  pkg_instr : instruction
+}.
+\end{lstlisting}
+
+Core theorem target:
+
+\begin{lstlisting}
+Theorem complex_leg_consistency :
+  forall O books now X,
+    X = match_complex O books now ->
+    executed X ->
+    exists k,
+      forall l,
+        In l (legs O) ->
+        filled_leg X l = k * Z.to_nat (Z.abs (ratio l)).
+\end{lstlisting}
+
+\subsection{Module \texttt{Certificates}}
+
+The final module should define compact certificates for exchange or regulatory checking. A simple matching certificate may contain per-order fill quantities and trade prices. A complex certificate may contain the package id, package scale \(k\), and component leg fills. The checker theorem should state:
+\begin{quote}
+If the verified checker accepts a certificate, then the corresponding execution satisfies the required matching invariants.
+\end{quote}
+
+\section{Current Evaluation and Completion Tests}
+
+The current evaluation is proof-oriented. A clean build elaborates the prototype and audit module; \texttt{Print Assumptions} confirms that the four completed headline declarations named in the audit module do not depend on admitted declarations. The kernel checker accepts the compiled development and separately exposes the six placeholders in the transitive module context. This is deliberately weaker than an end-to-end mechanism evaluation: there is not yet an extracted matcher, an adversarial-book generator, or a reference-engine comparison.
+
+Once the placeholders in Table~\ref{tab:audit} are discharged, the executable implementation should be evaluated in three additional ways.
+
+\paragraph{Synthetic adversarial books.}
+Generate books with expired contracts, invalid ticks, duplicate order identifiers, zero quantities, incompatible contracts, crossed books, partially fillable orders, and adversarial timestamp patterns. The verified checker should reject malformed outputs and accept outputs produced by the certified mechanism.
+
+\paragraph{Strategy-template tests.}
+Generate vertical spreads, calendars, diagonals, straddles, strangles, butterflies, collars, and covered calls. For each strategy, deliberately generate broken executions such as filling one leg but not the other, or filling legs in incorrect ratios. The complex checker should reject all broken executions.
+
+\paragraph{Reference-engine comparison.}
+Compare an unverified reference implementation against the verified program extracted from Coq. The comparison should follow the strategy of verified double-auction checkers: if the reference output disagrees with the verified output on per-order fill quantities under the same formal rule, the reference implementation violates the specified rule or implements a different rule.
+
+\section{Discussion}
+
+The proposed framework isolates the part of options trading that is best suited to formal verification: matching-engine correctness. A matching engine should satisfy hard invariants regardless of volatility, trader beliefs, pricing model, or hedging strategy. An order should not be overfilled. A buyer should not pay above the bid limit. A seller should not receive below the ask limit. A trade should not print on the wrong option series. An expired contract should not trade. A complex order should not become a broken strategy.
+
+The cleanest target architecture is layered:
+\[
+\text{single-series matching}
+\quad\longrightarrow\quad
+\text{opening auction}
+\quad\longrightarrow\quad
+\text{complex-order package execution}.
+\]
+In the completed development, single-series matching should establish contract identity, no overfill, individual rationality, tick validity, and fairness. Opening-auction verification should add uniform price, a concrete allocation, and maximum executable volume. Complex-order matching should then add ratio-preserving package execution. The present prototype checks only the cores identified in Table~\ref{tab:audit}; the arrows above are a dependency plan, not a completed theorem graph.
+
+\section{Limitations and Future Work}
+
+\paragraph{Allocation policies.}
+This draft uses price-time fairness. Real options venues may use pro-rata, customer-priority overlays, or hybrid allocation models. Future work should define an abstract allocation-policy interface and prove correctness for multiple policy instances.
+
+\paragraph{Venue-specific complex-order rules.}
+Real rulebooks contain many details: complex order auctions, legging restrictions, stock-option orders, priority customers, auctions, collars, drill-through protections, and class-specific minimum increments. This paper captures the core package invariant but does not attempt to reproduce every venue-specific rule.
+
+\paragraph{Mechanization status.}
+The prototype is buildable, but it is not complete: six declarations are admitted, no program is extracted, and several paper-level properties have no declaration yet. The ledger is therefore part of the artifact rather than an editorial appendix. A submission claiming an end-to-end verified mechanism should wait until the placeholder count is zero and the headline theorems are audited against the intended statements.
+
+\paragraph{No-arbitrage validation.}
+Static no-arbitrage validation is intentionally outside the first kernel. A natural second paper would verify monotonicity, convexity, calendar-spread consistency, put-call parity, and box-spread constraints over finite option chains.
+
+\section{Conclusion}
+
+This paper presents a verification blueprint and an audited Rocq prototype for option-market matching. The model extends ordinary double-auction objects with option-series identity and signed multi-leg strategies. Its central design invariant is package-scale sharing: all required legs of a complex execution must be filled in the prescribed ratios.
+
+The current artifact establishes useful but limited cores--notably recursive-step contract preservation, maximal selection from a finite candidate-price set, and the algebraic ratio-preservation core. End-to-end no overfill, limit respect, opening allocation, fairness, and the executable complex-order bridge remain explicit proof obligations. Reporting that boundary is a substantive improvement borrowed from the faithfulness discipline of the Lean mathematical-finance reference library.
+
+The central message survives the narrower claim: option-market verification should begin with microstructure correctness, not pricing. Once the matching kernel is complete, static no-arbitrage, volatility-surface consistency, margin rules, and portfolio-risk checks can be added as separately audited layers.
+
+\begin{thebibliography}{99}
+\raggedright
+
+\bibitem{NatarajanSarswatSingh2021}
+Raja Natarajan, Suneel Sarswat, and Abhishek Kr. Singh.
+\newblock Verified double sided auctions for financial markets.
+\newblock \emph{arXiv preprint arXiv:2104.08437}, 2021.
+\newblock Available at \url{https://arxiv.org/abs/2104.08437}.
+
+\bibitem{GargRajaSarswatSingh2024}
+Mohit Garg, N. Raja, Suneel Sarswat, and Abhishek Kr. Singh.
+\newblock Double auctions: Formalization and automated checkers.
+\newblock \emph{arXiv preprint arXiv:2410.18751}, 2024.
+\newblock Available at \url{https://arxiv.org/abs/2410.18751}.
+
+\bibitem{SarswatSingh2020}
+Suneel Sarswat and Abhishek Kr. Singh.
+\newblock Formally verified trades in financial markets.
+\newblock \emph{arXiv preprint arXiv:2007.10805}, 2020.
+\newblock Available at \url{https://arxiv.org/abs/2007.10805}.
+
+\bibitem{Coelho2026}
+Raphael Coelho.
+\newblock A formally verified library of mathematical finance in Lean 4.
+\newblock \emph{arXiv preprint arXiv:2606.01356}, 2026.
+\newblock Available at \url{https://arxiv.org/abs/2606.01356}.
+
+\bibitem{OCCEquityOptions}
+The Options Clearing Corporation.
+\newblock Equity options product specifications.
+\newblock Available at \url{https://www.theocc.com/clearance-and-settlement/clearing/equity-options-product-specifications}.
+
+\bibitem{CboeRuleBook}
+Cboe Exchange, Inc.
+\newblock Cboe Options Exchange Rule Book.
+\newblock Available at \url{https://cdn.cboe.com/resources/regulation/rule_book/C1_Exchange_Rule_Book.pdf}.
+
+\bibitem{SECOptionsRoundtable2026}
+U.S. Securities and Exchange Commission, Division of Trading and Markets.
+\newblock Roundtable on options market structure.
+\newblock Available at \url{https://www.sec.gov/files/roundtable-options-market-structure.pdf}.
+
+\bibitem{AitSahaliaDuarte2002}
+Yacine A{\"i}t-Sahalia and Jefferson Duarte.
+\newblock Nonparametric option pricing under shape restrictions.
+\newblock \emph{NBER Working Paper No. 8944}, 2002.
+\newblock Available at \url{https://www.nber.org/papers/w8944}.
+
+\bibitem{BreedenLitzenberger1978}
+Douglas T. Breeden and Robert H. Litzenberger.
+\newblock Prices of state-contingent claims implicit in option prices.
+\newblock \emph{The Journal of Business}, 51(4):621--651, 1978.
+
+\end{thebibliography}
+
+\end{document}

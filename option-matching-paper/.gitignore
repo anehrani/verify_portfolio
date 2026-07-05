@@ -1,0 +1,12 @@
+CoqMakefile
+CoqMakefile.conf
+.CoqMakefile.d
+*.aux
+*.glob
+*.vo
+*.vok
+*.vos
+*.log
+*.out
+*.toc
+*.synctex.gz

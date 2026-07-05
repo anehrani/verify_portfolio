@@ -1,0 +1,1011 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{listings}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  citecolor=blue,
+  urlcolor=blue
+}
+
+\lstdefinelanguage{Coq}{
+  keywords={Definition,Theorem,Lemma,Proof,Qed,Record,Fixpoint,forall,fun,match,with,end,Prop,if,then,else,Require,Import,Open,Scope},
+  keywordstyle=\color{blue},
+  comment=[s]{(*}{*)},
+  commentstyle=\color{gray},
+  morecomment=[s]{(**}{*)},
+  basicstyle=\ttfamily\small,
+  columns=fullflexible,
+  breaklines=true
+}
+
+\lstdefinelanguage{bash}{
+  keywords={cd,make,python3,pdflatex,bibtex},
+  keywordstyle=\color{blue},
+  basicstyle=\ttfamily\small,
+  columns=fullflexible,
+  breaklines=true
+}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{definition}{Definition}
+\newtheorem{lemma}{Lemma}
+
+\title{Machine-Checked Verification of Crypto Option Hedged Portfolios under Discontinuous Price Shocks}
+\author{FinShockVerify Project}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Crypto portfolios hedged with options are exposed to abrupt spot-price drops,
+volatile derivatives markets, venue risk, custody risk, and settlement
+ambiguity. A protective put can provide a mathematical downside floor, but only
+under explicit assumptions about payoff definition, enforceability, settlement,
+quantity matching, and premium accounting. This paper presents FinShockVerify,
+a prototype Rocq/Coq-based framework for machine-checking the accounting and
+risk invariants of crypto option hedged portfolios under discontinuous price
+shocks. The current artifact formalizes a single-asset portfolio state,
+price-jump transitions, fee-aware trades, finite weighted stress scenarios, a
+loss-floor checker, and a crypto protective-put payoff model using exact
+rational arithmetic. It proves that trades are self-financing up to explicit
+fees, that price jumps produce the expected mark-to-market profit and loss,
+that the executable loss-floor checker is sound with respect to the formal
+inequality, that a long-only fully invested portfolio cannot lose more than a
+common asset-return floor, and that a matching long-crypto plus long-put
+position has terminal wealth bounded below by cash minus premium plus units
+times strike. The contribution is not a market-prediction model or legal
+opinion. It is an artifact and design pattern for audit-grade verification of
+explicitly specified crypto portfolio stress and option-hedge logic.
+\end{abstract}
+
+\noindent\textbf{Keywords:} formal verification, Rocq, Coq, crypto options,
+protective puts, portfolio risk, stress testing, price jumps, model validation,
+financial technology
+
+\section{Introduction}
+
+Financial portfolios are exposed not only to gradual price changes but also to
+discontinuous jumps: earnings surprises, macroeconomic announcements, liquidity
+events, defaults, devaluations, market halts, and sudden repricings of risk.
+Portfolio risk systems therefore encode rules for marking positions to market,
+applying stress scenarios, rebalancing positions, charging transaction costs,
+and checking constraints such as solvency, leverage, mandate limits, or loss
+floors. These rules are often implemented in spreadsheets, scripts, risk
+engines, or portfolio-management platforms. The mathematical formulas may be
+simple, but the surrounding state transitions are a common source of errors:
+sign mistakes, inconsistent treatment of cash, incorrect fee accounting,
+incorrect pass/fail thresholds, and mismatch between the risk policy and its
+implementation.
+
+This paper studies a narrow question:
+
+\begin{quote}
+Can a proof assistant be used to verify that crypto option hedge logic
+preserves specified downside floors, accounting invariants, and stress-test
+claims under discontinuous price shocks?
+\end{quote}
+
+We answer this question with FinShockVerify, a small open-source prototype
+implemented in Rocq, the proof assistant historically known as Coq. The
+prototype intentionally begins with exact rational arithmetic and finite stress
+scenarios. This is a design choice. Continuous-time jump processes, stochastic
+calculus, and floating-point verification are important, but they are not the
+most direct path to a useful first verifier. Many operational risk checks are
+already defined over finite shock tables: equity down 20 percent, credit spreads
+up, rates down, foreign exchange up, or sector-specific shocks. Such scenarios
+are discrete, auditable, and close to the workflows used by risk teams.
+
+The main contributions of this paper are:
+
+\begin{enumerate}
+  \item A formal model of portfolio state for cash, risky holdings, prices,
+  price jumps, and fee-aware trades.
+  \item A formal payoff model for a crypto protective put and a proof that a
+  matching long-spot plus long-put position has a terminal value floor at the
+  option strike, net of explicitly modeled premium and cash.
+  \item Machine-checked proofs of basic accounting invariants, including
+  self-financing trades with explicit fees and mark-to-market profit and loss
+  under a price jump.
+  \item A finite weighted stress-scenario model with exact rational arithmetic.
+  \item A machine-checked soundness theorem for a Boolean loss-floor checker.
+  \item A proof that long-only fully invested portfolios inherit a common
+  asset-return floor at the portfolio level.
+  \item A small command-line checker that mirrors the formal definitions over
+  CSV inputs and demonstrates a path toward practical model-validation
+  tooling.
+\end{enumerate}
+
+The contribution is deliberately modest but concrete. FinShockVerify does not
+claim to prove that a portfolio is safe, profitable, or correctly priced. It
+claims something more precise: given an explicitly specified model of portfolio
+state and stress rules, the proof assistant can certify that the executable
+checks and transitions satisfy the stated mathematical invariants.
+
+\section{Motivation}
+
+Formal verification is already used in domains where small implementation
+errors can create large losses: compilers, cryptographic protocols, operating
+systems, smart contracts, and safety-critical systems. Financial risk
+infrastructure shares several properties with those domains. It uses precise
+rules, operates over state, produces decisions that affect money and capital,
+and must be explainable to auditors, regulators, clients, or counterparties.
+
+In financial institutions, model risk management guidance emphasizes robust
+model development, validation, governance, and controls. The Federal Reserve's
+SR 11-7 guidance describes model risk as the risk of adverse consequences from
+decisions based on incorrect or misused model outputs, and lists uses including
+stress testing, risk measurement, compliance with internal limits, and financial
+reporting \cite{fed2011sr117}. The Basel market-risk framework likewise places
+stress and model assessment at the center of market-risk capital, including
+expected shortfall models and separate treatment for non-modellable risk
+factors \cite{basel2019marketrisk}. These frameworks do not require proof
+assistants, but they create a natural environment for proof-carrying
+validation artifacts: if an institution says that a risk rule has a precise
+meaning, a machine-checked proof can help establish that the implementation
+matches that meaning.
+
+The motivating example for this prototype is a long-only equity-bond portfolio:
+
+\begin{center}
+\begin{tabular}{lrr}
+\toprule
+Asset & Weight & Stress return \\
+\midrule
+Equity & 70\% & -20\% \\
+Bonds & 30\% & 3\% \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The portfolio stress return is
+\[
+  0.70 \cdot (-0.20) + 0.30 \cdot 0.03 = -0.131,
+\]
+or -13.1 percent. If the loss floor is -15 percent, the scenario passes. A
+unit test can check this example. A proof assistant can do more: it can prove
+that the checker used for this computation is sound for every finite scenario
+in the model, and that entire classes of portfolios satisfy general bounds.
+
+\section{System Overview}
+
+FinShockVerify is organized around a small formal core and an executable
+adapter. The formal core is written in Rocq. The current repository contains
+four proof modules:
+
+\begin{itemize}
+  \item \texttt{theories/Core/SingleAsset.v}: portfolio value, price jumps,
+  and fee-aware trades for one risky asset.
+  \item \texttt{theories/Risk/WeightedStress.v}: finite weighted stress
+  scenarios, net weight, gross leverage, stress return, and loss-floor checks.
+  \item \texttt{theories/Options/CryptoProtectivePut.v}: crypto spot plus
+  long-put payoff logic and protective-put floor theorems.
+  \item \texttt{theories/Examples/LongOnlyETF.v}: a checked equity-bond
+  example.
+\end{itemize}
+
+The executable prototype is \texttt{tools/stress\_check.py}, a Python script
+that reads CSV scenario files and computes net weight, gross leverage, stress
+return, and pass/fail status using exact fractions. The Python tool is not
+itself formally verified in the current artifact. It is included to show the
+intended product direction: verified specifications should be usable through
+normal operational interfaces such as CSV files, scenario tables, and audit
+reports.
+
+\section{Formal Model}
+
+The MVP begins with a one-asset state. This is not intended to be a complete
+portfolio model. It is the smallest useful state transition on which price
+jump and trade accounting can be made precise.
+
+\subsection{State and Value}
+
+\begin{definition}[Portfolio state]
+A state consists of cash, risky-asset shares, and the current price:
+\[
+  s = (\mathrm{cash}, \mathrm{shares}, \mathrm{price}).
+\]
+\end{definition}
+
+The portfolio value is
+\[
+  V(s) = \mathrm{cash}(s) + \mathrm{shares}(s)\cdot\mathrm{price}(s).
+\]
+
+The Rocq definition is:
+
+\begin{lstlisting}[language=Coq]
+Record State := {
+  cash : Q;
+  shares : Q;
+  price : Q
+}.
+
+Definition portfolio_value (s : State) : Q :=
+  cash s + shares s * price s.
+\end{lstlisting}
+
+All quantities use Rocq rational numbers \texttt{Q}. This gives exact
+arithmetic and avoids the ambiguity of floating-point rounding. Later versions
+can add verified floating-point bounds, but the first layer should be a clear
+mathematical specification.
+
+\subsection{Price Jumps}
+
+A discontinuous price jump is modeled as a return \(r\) applied to the current
+price:
+\[
+  P' = P(1+r).
+\]
+Cash and shares do not change during the mark-to-market jump:
+
+\begin{lstlisting}[language=Coq]
+Definition apply_price_return (r : Q) (s : State) : State :=
+  {|
+    cash := cash s;
+    shares := shares s;
+    price := price s * (1 + r)
+  |}.
+\end{lstlisting}
+
+The first price-jump theorem states that the change in portfolio value equals
+the position size times the price change:
+
+\begin{theorem}[Price-jump profit and loss]
+For every state \(s\) and return \(r\),
+\[
+  V(\mathrm{jump}(r,s)) - V(s)
+  = \mathrm{shares}(s)\cdot\mathrm{price}(s)\cdot r.
+\]
+\end{theorem}
+
+In Rocq:
+
+\begin{lstlisting}[language=Coq]
+Theorem price_jump_pnl :
+  forall s r,
+    portfolio_value (apply_price_return r s) - portfolio_value s
+    == shares s * price s * r.
+\end{lstlisting}
+
+\subsection{Trades and Fees}
+
+A trade changes shares and cash at the current price. Buying \(q\) shares costs
+\(qP\); selling corresponds to negative \(q\). A nonnegative fee \(f\) is
+deducted from cash:
+
+\[
+  \mathrm{cash}' = \mathrm{cash} - qP - f,
+  \qquad
+  \mathrm{shares}' = \mathrm{shares} + q.
+\]
+
+\begin{lstlisting}[language=Coq]
+Definition trade (quantity fee : Q) (s : State) : State :=
+  {|
+    cash := cash s - quantity * price s - fee;
+    shares := shares s + quantity;
+    price := price s
+  |}.
+\end{lstlisting}
+
+The basic accounting theorem is:
+
+\begin{theorem}[Self-financing trade with explicit fee]
+For every state \(s\), quantity \(q\), and fee \(f\),
+\[
+  V(\mathrm{trade}(q,f,s)) = V(s) - f.
+\]
+\end{theorem}
+
+In Rocq:
+
+\begin{lstlisting}[language=Coq]
+Theorem trade_self_financing :
+  forall s quantity fee,
+    portfolio_value (trade quantity fee s) == portfolio_value s - fee.
+\end{lstlisting}
+
+This theorem is simple, but it captures a critical modeling principle: trading
+does not create or destroy portfolio value except through explicitly modeled
+costs. In larger systems, this is the type of invariant that can prevent
+subtle cash-position errors.
+
+\section{Crypto Protective-Put Hedge}
+
+Crypto option hedges are attractive because large spot-price moves are common
+and because listed or centrally intermediated derivatives can offer a more
+standardized risk-management surface than ad hoc off-chain agreements. They
+also introduce assumptions that must be made explicit. The CFTC states that
+virtual currencies such as Bitcoin have been treated as commodities under the
+Commodity Exchange Act and that its jurisdiction is implicated when virtual
+currency is used in a derivatives contract \cite{cftcBitcoinBasics}. Its
+customer advisory notes that futures and options may be used by hedgers to
+protect against virtual-currency volatility, while warning about volatility,
+cash-market manipulation, cyber risk, margin amplification, and the importance
+of understanding cash-settlement indexes \cite{cftcVirtualCurrencyAdvisory}.
+The CFTC's Coinflip action also illustrates that platforms offering Bitcoin
+options can raise registration and market-facility issues
+\cite{cftcCoinflip2015}.
+
+For this reason, FinShockVerify separates the mathematical hedge theorem from
+external regulatory and operational assumptions. The proof below assumes that
+the put option is valid, enforceable, quantity-matched, and settles according
+to its payoff definition. It does not prove venue registration, custody safety,
+oracle integrity, counterparty solvency, or legal eligibility.
+
+\subsection{Put Payoff}
+
+For final spot price \(S_T\) and strike \(K\), a long put has payoff
+\[
+  (K - S_T)^+ = \max(K - S_T, 0).
+\]
+
+The Rocq model uses an exact rational positive-part function:
+
+\begin{lstlisting}[language=Coq]
+Definition positive_part (x : Q) : Q :=
+  match Qlt_le_dec 0 x with
+  | left _ => x
+  | right _ => 0
+  end.
+
+Definition long_put_payoff (final_spot strike : Q) : Q :=
+  positive_part (strike - final_spot).
+\end{lstlisting}
+
+\subsection{Protected Terminal Wealth}
+
+For \(q\) units of crypto, cash \(C\), option premium \(P\), final spot
+\(S_T\), and strike \(K\), the protected terminal wealth is modeled as:
+\[
+  W = C - P + q\left(S_T + (K - S_T)^+\right).
+\]
+
+In Rocq:
+
+\begin{lstlisting}[language=Coq]
+Definition protected_crypto_value
+    (units final_spot strike : Q) : Q :=
+  units * (final_spot + long_put_payoff final_spot strike).
+
+Definition protected_crypto_wealth
+    (cash premium units final_spot strike : Q) : Q :=
+  cash - premium + protected_crypto_value units final_spot strike.
+\end{lstlisting}
+
+The central hedge theorem is:
+
+\begin{theorem}[Protective-put terminal wealth floor]
+If \(q \geq 0\), then for every final spot price \(S_T\),
+\[
+  C - P + qK
+  \leq
+  C - P + q\left(S_T + (K - S_T)^+\right).
+\]
+\end{theorem}
+
+In Rocq:
+
+\begin{lstlisting}[language=Coq]
+Theorem protected_crypto_wealth_floor :
+  forall cash premium units final_spot strike,
+    0 <= units ->
+    cash - premium + units * strike
+    <= protected_crypto_wealth cash premium units final_spot strike.
+\end{lstlisting}
+
+This is the precise version of the ``harsh drop'' safety claim. If the crypto
+price falls from \(S_0\) to zero, or to any lower stressed value, the terminal
+spot-plus-put component remains at least \(qK\), assuming the put settles as
+specified. The proof does not remove the option premium; it includes it
+explicitly. Therefore the guaranteed net floor is \(C - P + qK\), not \(qK\).
+
+The artifact also proves that the protected position dominates unhedged spot
+exposure:
+
+\begin{lstlisting}[language=Coq]
+Theorem protected_crypto_dominates_spot :
+  forall units final_spot strike,
+    0 <= units ->
+    crypto_spot_value units final_spot
+    <= protected_crypto_value units final_spot strike.
+\end{lstlisting}
+
+Finally, when the final spot price is below the strike, the protected value is
+exactly the strike floor:
+
+\begin{lstlisting}[language=Coq]
+Theorem protected_crypto_value_equals_floor_below_strike :
+  forall units final_spot strike,
+    final_spot <= strike ->
+    protected_crypto_value units final_spot strike == units * strike.
+\end{lstlisting}
+
+\subsection{Safety Case Boundaries}
+
+The proof should be used as part of a safety case, not as a standalone
+guarantee. A complete crypto option hedge validation should include at least
+the following assumptions:
+
+\begin{itemize}
+  \item the option contract is legally valid for the relevant participant and
+  jurisdiction;
+  \item the venue or intermediary is appropriately registered or exempt;
+  \item the settlement index and final settlement price are defined and
+  auditable;
+  \item the put quantity matches the spot crypto exposure;
+  \item option premium, fees, margin, and funding are included in wealth;
+  \item custody, wallet, exchange, counterparty, and cyber risks are modeled
+  separately;
+  \item stress scenarios include gap moves, flash crashes, liquidity shocks,
+  and settlement/index disruption.
+\end{itemize}
+
+\section{Finite Stress Scenarios}
+
+The second part of the MVP formalizes finite stress scenarios. Each leg has a
+portfolio weight \(w_i\) and an asset return \(r_i\). The stress return is the
+weighted sum:
+\[
+  R = \sum_i w_i r_i.
+\]
+
+The Rocq record is:
+
+\begin{lstlisting}[language=Coq]
+Record WeightedShock := {
+  weight : Q;
+  asset_return : Q
+}.
+\end{lstlisting}
+
+\subsection{Net Weight, Gross Leverage, and Stress Return}
+
+FinShockVerify defines:
+
+\[
+  \mathrm{netWeight} = \sum_i w_i,
+  \qquad
+  \mathrm{grossLeverage} = \sum_i |w_i|,
+  \qquad
+  \mathrm{stressReturn} = \sum_i w_i r_i.
+\]
+
+In Rocq, these are recursive functions over a list of \texttt{WeightedShock}
+records:
+
+\begin{lstlisting}[language=Coq]
+Fixpoint net_weight (scenario : list WeightedShock) : Q :=
+  match scenario with
+  | [] => 0
+  | leg :: rest => weight leg + net_weight rest
+  end.
+
+Fixpoint gross_leverage (scenario : list WeightedShock) : Q :=
+  match scenario with
+  | [] => 0
+  | leg :: rest => Qabs (weight leg) + gross_leverage rest
+  end.
+
+Fixpoint stress_return (scenario : list WeightedShock) : Q :=
+  match scenario with
+  | [] => 0
+  | leg :: rest => weight leg * asset_return leg + stress_return rest
+  end.
+\end{lstlisting}
+
+The model also defines common portfolio conditions:
+
+\begin{lstlisting}[language=Coq]
+Definition long_only (scenario : list WeightedShock) : Prop :=
+  Forall (fun leg => 0 <= weight leg) scenario.
+
+Definition returns_floor (floor : Q) (scenario : list WeightedShock) : Prop :=
+  Forall (fun leg => floor <= asset_return leg) scenario.
+
+Definition fully_invested (scenario : list WeightedShock) : Prop :=
+  net_weight scenario == 1.
+\end{lstlisting}
+
+\subsection{Executable Loss-Floor Check}
+
+A practical stress checker often needs to answer a Boolean question: did this
+scenario pass a loss floor?
+
+\[
+  \mathrm{passesLossFloor}(F, S) =
+  \begin{cases}
+  \mathrm{true} & \text{if } F \leq \mathrm{stressReturn}(S),\\
+  \mathrm{false} & \text{otherwise.}
+  \end{cases}
+\]
+
+The Rocq definition is:
+
+\begin{lstlisting}[language=Coq]
+Definition passes_loss_floor (floor : Q) (scenario : list WeightedShock) : bool :=
+  Qle_bool floor (stress_return scenario).
+\end{lstlisting}
+
+The soundness theorem connects the Boolean checker to the mathematical
+inequality:
+
+\begin{theorem}[Loss-floor checker soundness]
+If \texttt{passes\_loss\_floor floor scenario = true}, then
+\[
+  \mathrm{floor} \leq \mathrm{stressReturn}(\mathrm{scenario}).
+\]
+\end{theorem}
+
+In Rocq:
+
+\begin{lstlisting}[language=Coq]
+Theorem passes_loss_floor_sound :
+  forall floor scenario,
+    passes_loss_floor floor scenario = true ->
+    floor <= stress_return scenario.
+\end{lstlisting}
+
+This theorem matters because it ties executable pass/fail behavior to a formal
+specification. It is a small version of a larger product goal: risk reports
+should be accompanied by proof artifacts that explain what their pass/fail
+status means.
+
+\subsection{Long-Only Loss Floor}
+
+The main general theorem in the current MVP is a long-only loss-floor result.
+Suppose every portfolio weight is nonnegative, the weights sum to one, and
+every asset return is at least \(-\epsilon\). Then the portfolio return is also
+at least \(-\epsilon\).
+
+\begin{theorem}[Long-only fully invested loss floor]
+For every finite scenario \(S\) and rational \(\epsilon \geq 0\), if
+\[
+  w_i \geq 0,\quad \sum_i w_i = 1,\quad r_i \geq -\epsilon
+\]
+for every leg \(i\), then
+\[
+  \sum_i w_i r_i \geq -\epsilon.
+\]
+\end{theorem}
+
+In Rocq:
+
+\begin{lstlisting}[language=Coq]
+Theorem long_only_fully_invested_loss_floor :
+  forall scenario eps,
+    0 <= eps ->
+    long_only scenario ->
+    returns_floor (- eps) scenario ->
+    fully_invested scenario ->
+    - eps <= stress_return scenario.
+
+Theorem protected_crypto_wealth_floor :
+  forall cash premium units final_spot strike,
+    0 <= units ->
+    cash - premium + units * strike
+    <= protected_crypto_wealth cash premium units final_spot strike.
+\end{lstlisting}
+
+The theorem is mathematically elementary. Its significance is architectural:
+it demonstrates how portfolio mandates and stress assumptions can be stated as
+machine-checkable hypotheses and connected to portfolio-level risk guarantees.
+Later versions can generalize this pattern to leverage caps, position limits,
+sector constraints, margin rules, liquidity haircuts, and expected shortfall
+over finite scenario distributions.
+
+\section{Prototype Implementation}
+
+\subsection{Rocq Artifact}
+
+The Rocq artifact compiles using a standard \texttt{\_CoqProject} file and a
+Makefile. The build command is:
+
+\begin{lstlisting}[language=bash]
+make build
+\end{lstlisting}
+
+The current checked source files are summarized in Table~\ref{tab:artifact}.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lll}
+\toprule
+File & Role & Selected checked statements \\
+\midrule
+\texttt{SingleAsset.v} & Core state transitions &
+\texttt{trade\_self\_financing}, \texttt{price\_jump\_pnl} \\
+\texttt{Vanilla.v} & Vanilla option primitives &
+\texttt{option\_payoff\_nonnegative} \\
+\texttt{PortfolioValidation.v} & Option validation &
+\texttt{covered\_protective\_put\_wealth\_floor} \\
+\texttt{WeightedStress.v} & Finite stress scenarios &
+\texttt{passes\_loss\_floor\_sound},
+\texttt{long\_only\_fully\_invested\_loss\_floor} \\
+\texttt{CryptoProtectivePut.v} & Crypto option hedge &
+\texttt{protected\_crypto\_wealth\_floor} \\
+\texttt{LongOnlyETF.v} & Example portfolio &
+\texttt{equity\_bond\_verified\_loss\_floor} \\
+\bottomrule
+\end{tabular}
+\caption{Current FinShockVerify proof artifact.}
+\label{tab:artifact}
+\end{table}
+
+\subsection{Command-Line Checker}
+
+The Python command-line checker reads a CSV file with columns:
+\texttt{asset}, \texttt{weight}, and \texttt{return}. It computes the same
+finite-scenario quantities as the Rocq model, using Python's
+\texttt{Fraction} type to preserve exact arithmetic.
+
+Example input:
+
+\begin{lstlisting}
+asset,weight,return
+Equity,70/100,-20/100
+Bonds,30/100,3/100
+\end{lstlisting}
+
+Example command:
+
+\begin{lstlisting}[language=bash]
+python3 tools/stress_check.py examples/long_only_stress.csv --loss-floor=-15/100
+\end{lstlisting}
+
+Example output:
+
+\begin{lstlisting}
+FinShockVerify stress check
+scenario:       examples/long_only_stress.csv
+net weight:     1
+gross leverage: 1
+stress return:  -13.1000% (-131/1000)
+loss floor:     -15.0000% (-3/20)
+result:         PASS
+\end{lstlisting}
+
+The Python script is best viewed as a user-facing adapter to the formal
+specification. A future version should generate executable code directly from
+Rocq extraction, or use proof-producing checkers so the command-line result is
+linked more tightly to the proof artifact.
+
+\section{Evaluation}
+
+The current evaluation is intentionally small. The goal is to show that the
+approach can verify meaningful accounting and stress invariants, not to
+benchmark a production risk engine.
+
+\subsection{Case Study 1: Equity-Bond Shock}
+
+The checked example uses a two-leg portfolio:
+
+\begin{align*}
+  w_{\mathrm{equity}} &= 70/100, &
+  r_{\mathrm{equity}} &= -20/100,\\
+  w_{\mathrm{bond}} &= 30/100, &
+  r_{\mathrm{bond}} &= 3/100.
+\end{align*}
+
+The formal example proves:
+
+\begin{itemize}
+  \item the weights are fully invested;
+  \item the weights are long-only;
+  \item each return is at least -20 percent;
+  \item the exact stress return is -131/1000;
+  \item the Boolean loss-floor checker passes a -15 percent floor;
+  \item the general long-only loss-floor theorem applies to the scenario.
+\end{itemize}
+
+This example illustrates the two layers of the system. The concrete
+calculation verifies one scenario. The general theorem verifies a class of
+scenarios satisfying stated hypotheses.
+
+\subsection{Case Study 2: One-Bitcoin Protective Put}
+
+The crypto hedge module contains a simple checked crash example: one unit of
+crypto, a put strike of 80,000, final stressed spot of 30,000, and option
+premium of 5,000. The theorem proves:
+
+\[
+  0 - 5000 + 1\cdot 80000
+  \leq
+  W(0,5000,1,30000,80000).
+\]
+
+That is, even after a severe drop to 30,000, the protected terminal wealth is
+bounded below by 75,000 under the payoff-settlement assumptions. The same
+theorem also covers a drop to zero or any other final spot price, because the
+proof quantifies over all final spots.
+
+\subsection{Case Study 3: Trade Accounting}
+
+The one-asset trade model verifies that a trade at the current price is
+self-financing up to explicit fees. This is a foundational invariant for later
+rebalancing models. Without such a theorem, a rebalancing procedure could
+accidentally create or destroy value through inconsistent cash and holdings
+updates.
+
+\subsection{Case Study 4: Price-Jump Mark-to-Market}
+
+The price-jump model verifies that holding \(h\) shares at price \(P\) and
+applying return \(r\) changes portfolio value by \(hPr\). This theorem is a
+building block for multi-asset mark-to-market logic, stress loss attribution,
+and scenario explanation.
+
+\subsection{Limitations of the Current Evaluation}
+
+The current artifact has five major limitations:
+
+\begin{enumerate}
+  \item The trade model is single-asset.
+  \item The stress model is finite and deterministic.
+  \item The Python CLI is specification-aligned but not extracted from Rocq.
+  \item The protective-put theorem assumes correct option settlement and does
+  not yet model venue default, custody loss, liquidation, margin calls, or
+  index manipulation.
+  \item The artifact does not yet verify floating-point behavior.
+\end{enumerate}
+
+These limitations are acceptable for a first artifact, but they define the
+minimum roadmap before claiming production-grade validation.
+
+\section{Business and Validation Use Case}
+
+The practical value of FinShockVerify lies in model validation and audit
+evidence. A financial institution or fintech company may already have a policy
+such as:
+
+\begin{quote}
+For each approved finite stress scenario, the post-shock portfolio must satisfy
+loss, leverage, cash, and mandate constraints after applying the documented
+rebalancing rule and transaction-cost model.
+\end{quote}
+
+Traditional testing can sample cases. A proof assistant can verify universal
+statements about all states satisfying the policy hypotheses. The likely first
+commercial product is therefore not a trading strategy. It is a validation
+tool that produces:
+
+\begin{itemize}
+  \item a formal specification of portfolio transition rules;
+  \item executable checks over portfolio and scenario files;
+  \item machine-checked proof artifacts for core invariants;
+  \item human-readable audit reports explaining assumptions and guarantees.
+\end{itemize}
+
+This positioning is consistent with model-risk governance: the system verifies
+that specified rules are implemented correctly. It does not certify that the
+rules are economically sufficient or that the stress scenarios are complete.
+
+\section{Related Work}
+
+\subsection{Formalized Mathematical Finance}
+
+Coelho's Lean 4 mathematical finance library formalizes a broad collection of
+results across stochastic calculus, derivative pricing, risk, portfolio, and
+fixed-income theory \cite{coelho2026leanfinance}. That work is broader and
+more mathematical than FinShockVerify. Its contribution is reusable verified
+foundations for mathematical finance. FinShockVerify instead focuses on an
+operational layer: state transitions, finite stress scenarios, and audit-style
+checks for portfolio logic.
+
+\subsection{Financial Contract Semantics}
+
+The Findel line of work formalizes a domain-specific language for financial
+derivatives in Coq and proves properties of financial contracts
+\cite{arusoaie2019findel,arusoaie2020findelcert}. This work is close in spirit
+because it treats financial artifacts as formal objects with machine-checked
+semantics. FinShockVerify differs by focusing on portfolio-level stress and
+rebalancing transitions rather than derivative-contract semantics.
+
+Earlier functional-programming work on compositional financial contracts also
+showed how financial products can be represented as precise executable
+denotations \cite{jones2000composing}. FinShockVerify follows the same broad
+philosophy: financial logic should be made explicit, compositional, and
+checkable.
+
+\subsection{Verified Market Mechanisms}
+
+Sarswat and Singh formalized properties of financial-market trades and double
+auction mechanisms in Coq, including fairness, uniformity, and individual
+rationality \cite{sarswat2020verifiedtrades}. That line of work verifies
+market mechanisms. FinShockVerify verifies portfolio state and risk logic after
+market events are represented as price shocks or trades.
+
+\subsection{Financial Standards and Risk Governance}
+
+ACTUS provides machine-readable algorithmic representations of financial
+contracts and emphasizes consistent, precise representation of contract logic
+\cite{actusfrf}. FinShockVerify is complementary: a future version could import
+standardized contract cash-flow descriptions and verify portfolio-level stress
+rules over the resulting exposures.
+
+Regulatory and supervisory sources motivate the need for validation artifacts.
+SR 11-7 emphasizes robust model development, validation, governance, and
+controls \cite{fed2011sr117}. Basel's market-risk framework emphasizes
+expected shortfall models, non-modellable risk factors, and stress-related
+assessment \cite{basel2019marketrisk}. FinShockVerify should be understood as
+technical infrastructure that can support such validation, not as a replacement
+for expert economic judgment.
+
+\section{Roadmap}
+
+The next version of FinShockVerify should add the following features.
+
+\subsection{Multi-Asset Portfolio State}
+
+The one-asset model should be generalized to vectors or finite maps of assets:
+
+\[
+  V(s) = \mathrm{cash}(s) + \sum_i h_i(s) P_i(s).
+\]
+
+The corresponding theorem should prove that applying a vector of returns
+produces:
+
+\[
+  V(s') - V(s) = \sum_i h_i P_i r_i.
+\]
+
+\subsection{Verified Rebalancing}
+
+The most important extension is verified rebalancing. A rebalancing rule maps
+current holdings, prices, and target weights to trades. The core theorem should
+state that the rebalance preserves value up to explicit transaction costs:
+
+\[
+  V(\mathrm{rebalance}(s)) = V(s) - \mathrm{costs}.
+\]
+
+Additional theorems should prove that target-weight constraints, position
+limits, cash constraints, and leverage limits hold after rebalancing when the
+algorithm returns success.
+
+\subsection{Transaction Costs and Liquidity Haircuts}
+
+The MVP includes a scalar fee. Production risk systems need richer cost
+models: proportional costs, fixed ticket costs, bid-ask spread, slippage,
+market-impact approximations, and liquidity haircuts. Each model can be
+specified as a function and connected to accounting theorems.
+
+\subsection{Crypto Option Hedge Extensions}
+
+The protective-put theorem should be extended into a full crypto option hedge
+validator. The next proof obligations are:
+
+\begin{itemize}
+  \item cash-settled and physically settled option variants;
+  \item option premium, exchange fees, funding costs, and collateral
+  requirements;
+  \item margin-call and liquidation transitions for leveraged crypto exposure;
+  \item settlement index definitions and admissible oracle/index inputs;
+  \item counterparty, clearing, or venue-default assumptions represented as
+  explicit hypotheses;
+  \item portfolio-level hedges with imperfect quantity matching, multiple
+  strikes, collars, spreads, and rolling maturities.
+\end{itemize}
+
+\subsection{Finite Expected Shortfall}
+
+The finite stress-scenario model should be extended with scenario
+probabilities. This enables verification of expected loss and finite expected
+shortfall calculations. Expected shortfall and coherent risk measures are
+standard tools in modern risk management
+\cite{artzner1999coherent,rockafellar2000cvar}. A finite-scenario
+formalization remains simpler than continuous probability theory while covering
+many historical and hypothetical scenario workflows.
+
+\subsection{Extraction and Proof-Carrying Reports}
+
+The Python CLI should eventually be replaced or supplemented by extracted code
+from Rocq. The long-term product should produce a report containing:
+
+\begin{itemize}
+  \item input files and hashes;
+  \item scenario results;
+  \item checked theorem names;
+  \item assumptions used;
+  \item reproducible build commands.
+\end{itemize}
+
+\section{Threats to Validity}
+
+The primary threat is specification error. A proof assistant can verify that an
+implementation matches a formal specification, but it cannot guarantee that the
+specification captures all economically relevant risks. Scenario selection,
+liquidity assumptions, and model boundaries still require expert judgment.
+
+The second threat is abstraction error. The current model uses rational
+arithmetic and simplified state transitions. This is appropriate for a clean
+specification, but production systems often use decimal conventions,
+rounding, settlement delays, tax lots, corporate actions, and floating-point
+analytics. Future work must either verify these details or clearly separate
+the idealized specification from implementation-specific behavior.
+
+The third threat is artifact integration. The current CLI mirrors the formal
+definitions, but it is not extracted from Rocq. A production verifier should
+reduce this gap by extracting executable code, generating proof certificates,
+or producing machine-checkable traces.
+
+\section{Conclusion}
+
+FinShockVerify demonstrates a practical first step toward proof-carrying
+crypto portfolio risk infrastructure. The current artifact formalizes price
+jumps, fee-aware trades, finite stress scenarios, long-only loss floors, and a
+crypto protective-put floor using exact rational arithmetic in Rocq. It proves
+basic accounting and risk invariants and connects them to a small executable
+stress checker.
+
+The main lesson is not that proof assistants can predict markets. They cannot.
+The lesson is that many parts of financial risk infrastructure are rule-based,
+stateful, and mathematically precise. Those parts can be specified and
+machine-checked. For crypto option hedged portfolios exposed to sudden price
+jumps, this creates a path toward auditable validation artifacts: executable
+checks whose meaning is backed by formal proofs and whose assumptions are
+explicit enough for model-risk review.
+
+\appendix
+
+\section{Artifact Reproduction}
+
+The artifact can be built with:
+
+\begin{lstlisting}[language=bash]
+cd finshock-verify
+make build
+\end{lstlisting}
+
+The example stress checker can be run with:
+
+\begin{lstlisting}[language=bash]
+python3 tools/stress_check.py examples/long_only_stress.csv --loss-floor=-15/100
+\end{lstlisting}
+
+The expected output contains:
+
+\begin{lstlisting}
+stress return:  -13.1000% (-131/1000)
+result:         PASS
+\end{lstlisting}
+
+\section{Selected Rocq Statements}
+
+\begin{lstlisting}[language=Coq]
+Theorem trade_self_financing :
+  forall s quantity fee,
+    portfolio_value (trade quantity fee s) == portfolio_value s - fee.
+
+Theorem price_jump_pnl :
+  forall s r,
+    portfolio_value (apply_price_return r s) - portfolio_value s
+    == shares s * price s * r.
+
+Theorem passes_loss_floor_sound :
+  forall floor scenario,
+    passes_loss_floor floor scenario = true ->
+    floor <= stress_return scenario.
+
+Theorem long_only_fully_invested_loss_floor :
+  forall scenario eps,
+    0 <= eps ->
+    long_only scenario ->
+    returns_floor (- eps) scenario ->
+    fully_invested scenario ->
+    - eps <= stress_return scenario.
+\end{lstlisting}
+
+\bibliographystyle{plain}
+\bibliography{references}
+
+\end{document}
